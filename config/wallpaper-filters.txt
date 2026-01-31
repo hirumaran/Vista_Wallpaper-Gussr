@@ -1,0 +1,185 @@
+# Bing Wallpaper Filter Configuration
+# Customize which wallpapers to keep or skip based on keywords
+# Keywords are matched case-insensitively in title, caption, and description fields
+
+# ============================================
+# KEEP KEYWORDS - Wallpapers containing these are preferred
+# ============================================
+# Nature & Landscapes
+mountain
+mountains
+beach
+beaches
+ocean
+sea
+coast
+coastal
+forest
+forests
+jungle
+island
+islands
+lake
+lakes
+river
+rivers
+waterfall
+waterfalls
+valley
+valleys
+canyon
+glacier
+glacier
+volcano
+
+# Wildlife & Animals
+wildlife
+animal
+animals
+bird
+birds
+elephant
+tiger
+lion
+leopard
+cheetah
+whale
+whales
+dolphin
+penguins
+penguin
+polar bear
+giraffe
+zebra
+rhino
+monkey
+eagle
+hawk
+owl
+butterfly
+wolf
+wolves
+fox
+bear
+deer
+moose
+
+# Architecture & Historic
+castle
+castles
+palace
+temple
+temples
+church
+cathedral
+mosque
+architect
+architecture
+historic
+historical
+ancient
+ruins
+monument
+landmark
+
+# Scenic & Tourism
+national park
+park
+landscape
+landscapes
+scenic
+scenery
+nature
+natural
+wonder
+wonders
+reserve
+conservancy
+
+# Nature Phenomena
+aurora
+auroras
+sunset
+sunrise
+sunlight
+rainbow
+mist
+fog
+clouds
+stars
+starry
+milky way
+reflection
+autumn
+spring
+blossom
+cherry blossom
+fall colors
+autumn colors
+winter
+snow
+
+# ============================================
+# SKIP KEYWORDS - Wallpapers containing these are rejected
+# ============================================
+# Space & Satellite Images (usually boring as wallpaper)
+earth from space
+satellite view
+satellite image
+space station
+international space station
+iss
+nasa
+orbit
+planetary
+
+# Abstract & Artistic (not good for daily wallpapers)
+abstract
+abstract art
+artistic pattern
+geometric
+geometric pattern
+fractal
+digital art
+illustration
+graphic design
+conceptual art
+modern art
+contemporary art
+
+# Scientific/Microscopic (too technical)
+microscopic
+microscope
+magnification
+cellular
+cell
+bacteria
+virus
+molecule
+atom
+particle
+
+# Diagrams & Infographics (not scenic)
+diagram
+infographic
+chart
+graph
+map
+cartography
+topographic
+
+# Random/Still Life (not engaging)
+still life
+random objects
+everyday objects
+collection of
+assortment
+variety of
+
+# Dark/Minimalist (usually boring)
+minimalist
+minimalism
+solid color
+plain
+dark background
+black background

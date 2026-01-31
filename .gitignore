@@ -1,0 +1,10 @@
+node_modules/
+.DS_Store
+debug.log
+*.log
+__pycache__/
+.env
+.nyc_output
+/coverage
+.nyc_output
+.DS_Store
