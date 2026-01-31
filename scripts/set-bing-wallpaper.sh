@@ -219,9 +219,7 @@ set_wallpaper_stable() {
     sync
     
     # 2. Smoothly apply to all desktops using System Events
-    # We iterate through every desktop (Space/Monitor) and set the picture.
-    # This avoids 'killall Dock' which causes screen flickering/glitching.
-    
+    # This handles the currently active displays immediately.
     log "Applying to all desktops via System Events..."
     
     osascript -e '
@@ -237,6 +235,20 @@ set_wallpaper_stable() {
     on error errMsg
         return "ERROR: " & errMsg
     end try' 2>/dev/null
+    
+    # 3. Persistent Fix for Clamshell/Spaces (The "Hidden" Update)
+    # macOS treats "Clamshell Mode" (Lid Closed) as a separate display arrangement.
+    # The AppleScript above only sees *currently* active desktops.
+    # To fix the "revert" issue when you close the lid, we update the internal database.
+    # We DO NOT kill the Dock (which causes the "tweaking"), we just seed the DB
+    # so the next time macOS looks for the wallpaper (i.e. layout change), it finds ours.
+    
+    local db_path="$HOME/Library/Application Support/Dock/desktoppicture.db"
+    if [ -f "$db_path" ]; then
+        log "Seeding wallpaper database for future layouts (Clamshell fix)..."
+        # Update ALL entries in the data table to point to our wallpaper
+        sqlite3 "$db_path" "UPDATE data SET value = '$stable_path';" 2>/dev/null
+    fi
     
     # Verify
     local current_wp
