@@ -204,8 +204,19 @@ set_wallpaper_stable() {
     # We update persistence/Main to ALWAYS have the new image.
     # We update refresh/Alt to ALWAYS have the new image.
     
-    local main_file="current_wallpaper.jpg"
-    local alt_file="current_wallpaper_refresh.jpg"
+    # QUALITY FIX: Convert to PNG
+    # macOS lock screen often handles PNGs with better quality/less compression than JPGs.
+    local png_path="${image_path%.*}.png"
+    log "Converting to PNG for maximum lockscreen quality: $png_path"
+    sips -s format png "$image_path" --out "$png_path" >/dev/null 2>&1
+    
+    # Use the PNG if conversion succeeded, otherwise fallback to original
+    if [ -f "$png_path" ]; then
+        image_path="$png_path"
+    fi
+    
+    local main_file="current_wallpaper.png"
+    local alt_file="current_wallpaper_refresh.png"
     
     local main_path="$STABLE_WALLPAPER_DIR/$main_file"
     local alt_path="$STABLE_WALLPAPER_DIR/$alt_file"
