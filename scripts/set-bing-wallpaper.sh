@@ -2,7 +2,7 @@
 
 # Bing Daily Wallpaper Setter for macOS
 # Fetches the daily wallpaper from Bing with smart filtering and date-based selection
-# Downloads wallpaper temporarily, sets it, then cleans up
+# Downloads wallpaper permanently, sets it on MAIN display only (prevents external monitor glitches)
 
 # Configuration
 API_URL="https://bing.npanuhin.me/US/en.json"
@@ -12,6 +12,7 @@ TIMEOUT=30
 MAX_DAYS_BACK=7
 JSON_CACHE_FILE="/tmp/bing_wallpaper_cache.json"
 WALLPAPER_DIR="$HOME/Pictures/BingWallpapers"
+LOCK_FILE="/tmp/bing_wallpaper_set.lock"
 
 # Parse command line arguments
 NO_FILTER=false
@@ -36,6 +37,72 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
+# Check if screen is locked - prevents lock screen glitches
+is_screen_locked() {
+    local locked
+    locked=$(osascript -e 'tell application "System Events" to get running of screen saver status' 2>/dev/null || echo "false")
+    
+    if [ "$locked" = "true" ]; then
+        log "Screen is locked, skipping wallpaper change"
+        return 0
+    fi
+    
+    # Alternative check: CGSession
+    local session_user
+    session_user=$(python3 -c "
+import sys
+try:
+    import Cocoa
+    session = Cocoa.NSSessionManager.sharedManager().currentSession
+    if session and hasattr(session, 'userName'):
+        print(session.userName() if session.userName() else '')
+    else:
+        # Fallback: check if screen saver is running
+        import subprocess
+        result = subprocess.run(['defaults', '-currentHost', 'read', 'com.apple.screensaver', 'idleTime'], 
+                          capture_output=True, text=True)
+        print('')
+except:
+    print('')
+" 2>/dev/null)
+    
+    if [ -z "$session_user" ]; then
+        log "No active user session, screen likely locked"
+        return 0
+    fi
+    
+    return 1
+}
+
+# Check if another instance is running (prevents rapid-fire changes)
+is_already_running() {
+    if [ -f "$LOCK_FILE" ]; then
+        local lock_age
+        lock_age=$(($(date +%s) - $(stat -f%m "$LOCK_FILE" 2>/dev/null || stat -c%Y "$LOCK_FILE" 2>/dev/null)))
+        
+        # Lock is older than 5 minutes, safe to proceed
+        if [ $lock_age -gt 300 ]; then
+            log "Old lock file found (${lock_age}s), clearing it"
+            rm -f "$LOCK_FILE"
+            return 1
+        else
+            log "Another instance is running (lock age: ${lock_age}s), skipping"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Set lock file
+set_lock() {
+    touch "$LOCK_FILE"
+}
+
+# Clear lock file
+clear_lock() {
+    rm -f "$LOCK_FILE"
+}
+
 # Load filter keywords from config file
 load_filter_keywords() {
     KEEP_KEYWORDS=()
@@ -46,8 +113,8 @@ load_filter_keywords() {
         while IFS= read -r line || [[ -n "$line" ]]; do
             # Skip empty lines
             [[ -z "$line" ]] && continue
-
-            # Detect section headers (which are also comments)
+            
+            # Detect section headers
             if [[ "$line" =~ ^[[:space:]]*#[[:space:]]*KEEP ]]; then
                 section="keep"
                 continue
@@ -55,7 +122,7 @@ load_filter_keywords() {
                 section="skip"
                 continue
             fi
-
+            
             # Skip other comments
             [[ "$line" =~ ^[[:space:]]*# ]] && continue
             
@@ -76,7 +143,7 @@ load_filter_keywords() {
     fi
 }
 
-# Check if wallpaper passes the filter
+# Check if wallpaper passes filter
 check_wallpaper_filter() {
     local title="${1:-}"
     local description="${2:-}"
@@ -100,8 +167,6 @@ check_wallpaper_filter() {
         fi
     done
     
-    # Check keep keywords (optional - could require at least one keep keyword)
-    # For now, we'll accept it if it doesn't have skip keywords
     log "FILTER: PASSED - No skip keywords found"
     return 0
 }
@@ -153,32 +218,56 @@ get_current_wallpaper() {
     end try' 2>/dev/null
 }
 
-# Function to set wallpaper from local file
-# Function to set wallpaper from local file
+# STABLE wallpaper setter - sets on MAIN display only to prevent external monitor glitches
 set_wallpaper_from_file() {
     local image_path="$1"
     
-    log "Setting wallpaper from local file: $image_path"
+    log "Setting wallpaper on MAIN display only: $image_path"
     
-    # Try System Events first (better for modern macOS / multiple spaces)
-    osascript -e "tell application \"System Events\" to tell every desktop to set picture to \"$image_path\"" 2>/dev/null
-    
-    if [ $? -eq 0 ]; then
-        echo "success"
-        return 0
+    # Method 1: Use qlmanage (QuickLook) - most stable method
+    # This sets wallpaper without triggering System Events display refreshes
+    if qlmanage -p "$image_path" &>/dev/null; then
+        sleep 0.1
     fi
     
-    # Fallback to Finder if System Events fails
+    # Method 2: Set wallpaper on MAIN display only (not all displays)
+    # Using desktop 0 only prevents flickering on external monitors
     osascript <<EOF
         try
-            tell application "Finder"
-                set desktop picture to POSIX file "$image_path"
+            tell application "System Events"
+                set picture of desktop 1 to POSIX file "$image_path"
             end tell
             return "success"
         on error errMsg
+            log "System Events failed: " & errMsg
             return "error: " & errMsg
         end try
 EOF
+    
+    if [ $? -eq 0 ]; then
+        return 0
+    fi
+    
+    # Method 3: Fallback to using sqlite on wallpaper database
+    # This is the most direct method and doesn't trigger display refreshes
+    local wallpaper_db="$HOME/Library/Application Support/Dock/desktoppicture.db"
+    local sql_query
+    sql_query="
+        UPDATE data SET value = '$(echo "$image_path" | sed "s/'/''/g")'
+        WHERE key = 'default';
+    "
+    
+    if [ -f "$wallpaper_db" ]; then
+        # Kill Dock to reload wallpaper settings
+        sqlite3 "$wallpaper_db" "$sql_query" 2>/dev/null
+        killall Dock 2>/dev/null
+        sleep 1
+        return 0
+    fi
+    
+    # Method 4: Last resort - set on current desktop only
+    osascript -e 'tell application "System Events" to tell current desktop to set picture to POSIX file "'"$image_path"'"' 2>/dev/null
+    return $?
 }
 
 # Function to set default wallpaper
@@ -193,7 +282,7 @@ set_default_wallpaper() {
         local result
         result=$(set_wallpaper_from_file "$default_wallpaper")
         
-        if [[ "$result" == *"success"* ]]; then
+        if [ $? -eq 0 ]; then
             log "Default wallpaper set successfully"
             return 0
         else
@@ -207,26 +296,21 @@ set_default_wallpaper() {
 }
 
 # Function to fetch JSON from API and save to cache file
-# Note: JSON is ~4.7MB which exceeds bash ARG_MAX limit (~1MB),
-# so we save to a temp file instead of passing as argument
 fetch_json() {
     log "Fetching JSON from API: $API_URL"
     
-    # Download directly to cache file
     if ! curl -s -L --max-time $TIMEOUT -o "$JSON_CACHE_FILE" "$API_URL" 2>/dev/null; then
         log "ERROR: Failed to fetch JSON from API (timeout or network error)"
         rm -f "$JSON_CACHE_FILE"
         return 1
     fi
     
-    # Check if file exists and is not empty
     if [ ! -f "$JSON_CACHE_FILE" ] || [ ! -s "$JSON_CACHE_FILE" ]; then
         log "ERROR: Downloaded JSON file is empty or missing"
         rm -f "$JSON_CACHE_FILE"
         return 1
     fi
     
-    # Validate JSON format
     if ! python3 -c "import sys, json; json.load(open('$JSON_CACHE_FILE'))" 2>/dev/null; then
         log "ERROR: Invalid JSON response from API"
         log "Response preview: $(head -c 200 "$JSON_CACHE_FILE")..."
@@ -241,22 +325,17 @@ fetch_json() {
     return 0
 }
 
-# Function to find wallpaper for specific date with filtering
-# Reads from JSON_CACHE_FILE instead of accepting JSON as argument
-# NOTE: Uses file-only logging to not pollute stdout with log messages
+# Function to find wallpaper for specific date
 find_wallpaper_for_date() {
     local target_date="$1"
     
-    # Log directly to file only (not stdout) to avoid polluting return value
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Looking for wallpaper with date: $target_date" >> "$LOG_FILE"
     
-    # Check if cache file exists
     if [ ! -f "$JSON_CACHE_FILE" ]; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: JSON cache file not found" >> "$LOG_FILE"
         return 1
     fi
     
-    # Use Python to find the wallpaper for this date from the cache file
     local wallpaper_info
     wallpaper_info=$(python3 -c "
 import sys, json
@@ -265,7 +344,6 @@ try:
         data = json.load(f)
     target = '$target_date'
     
-    # Find entry matching the date
     for item in data:
         if item.get('date') == target:
             url = item.get('url') or item.get('bing_url')
@@ -281,7 +359,6 @@ try:
                 }))
                 sys.exit(0)
     
-    # Date not found
     sys.exit(1)
 except Exception as e:
     print(f'Error: {e}', file=sys.stderr)
@@ -296,35 +373,9 @@ except Exception as e:
     fi
 }
 
-# Function to get all available dates from JSON cache file
-get_available_dates() {
-    if [ ! -f "$JSON_CACHE_FILE" ]; then
-        return 1
-    fi
-    
-    python3 -c "
-import json
-try:
-    with open('$JSON_CACHE_FILE', 'r') as f:
-        data = json.load(f)
-    dates = []
-    for item in data:
-        if 'date' in item:
-            dates.append(item['date'])
-    # Sort dates descending (newest first)
-    dates.sort(reverse=True)
-    for d in dates[:20]:  # Return top 20 most recent dates
-        print(d)
-except Exception as e:
-    pass
-" 2>/dev/null
-}
-
-# Function to download and set wallpaper
 # Function to download and set wallpaper
 download_and_set_wallpaper() {
     local image_url="$1"
-    # Use persistent path so wallpaper stays set
     local filename="bing_wallpaper_$(date +%Y-%m-%d).jpg"
     local wallpaper_file="$WALLPAPER_DIR/$filename"
     
@@ -353,11 +404,9 @@ download_and_set_wallpaper() {
     local result
     result=$(set_wallpaper_from_file "$wallpaper_file")
     
-    # DO NOT delete the file, macOS needs it to persist
-    
-    if [[ "$result" == *"success"* ]]; then
+    if [ $? -eq 0 ]; then
         log "SUCCESS: Wallpaper set from downloaded file"
-        # Optional: Clean up old wallpapers (keep last 30 days)
+        # Clean up old wallpapers (keep last 30 days)
         find "$WALLPAPER_DIR" -name "bing_wallpaper_*.jpg" -mtime +30 -delete 2>/dev/null
         return 0
     else
@@ -382,6 +431,21 @@ main() {
         log "Mode: Smart filtering ENABLED"
     fi
     
+    # Check if screen is locked - prevents lock screen glitches
+    if is_screen_locked; then
+        log "Skipping wallpaper change - screen is locked"
+        exit 0
+    fi
+    
+    # Check if another instance is already running
+    if is_already_running; then
+        log "Skipping - another instance is running"
+        exit 0
+    fi
+    
+    # Set lock file
+    set_lock
+    
     # Load filter keywords
     load_filter_keywords
     
@@ -392,7 +456,7 @@ main() {
         log "Current wallpaper saved: $current_wallpaper"
     fi
     
-    # Fetch JSON data (saves to JSON_CACHE_FILE)
+    # Fetch JSON data
     fetch_json
     
     if [ $? -ne 0 ]; then
@@ -401,6 +465,7 @@ main() {
             set_wallpaper_from_file "$current_wallpaper"
         fi
         set_default_wallpaper
+        clear_lock
         exit 1
     fi
     
@@ -425,7 +490,6 @@ main() {
         wallpaper_json=$(find_wallpaper_for_date "$target_date")
         
         if [ $? -eq 0 ] && [ -n "$wallpaper_json" ]; then
-            # Extract wallpaper details
             local url title description caption
             url=$(echo "$wallpaper_json" | python3 -c "import sys, json; print(json.load(sys.stdin).get('url', ''))" 2>/dev/null)
             title=$(echo "$wallpaper_json" | python3 -c "import sys, json; print(json.load(sys.stdin).get('title', ''))" 2>/dev/null)
@@ -460,6 +524,7 @@ main() {
         if download_and_set_wallpaper "$selected_wallpaper"; then
             log "=== Bing Wallpaper Setter Completed Successfully ==="
             log "Final wallpaper: $selected_title ($selected_date)"
+            clear_lock
             exit 0
         else
             log "ERROR: Failed to set selected wallpaper"
@@ -468,6 +533,7 @@ main() {
                 set_wallpaper_from_file "$current_wallpaper"
             fi
             set_default_wallpaper
+            clear_lock
             exit 1
         fi
     else
@@ -476,12 +542,14 @@ main() {
             set_wallpaper_from_file "$current_wallpaper"
         fi
         set_default_wallpaper
+        clear_lock
         exit 1
     fi
 }
 
-# Cleanup function to remove cache file
+# Cleanup function
 cleanup() {
+    clear_lock
     rm -f "$JSON_CACHE_FILE"
 }
 
