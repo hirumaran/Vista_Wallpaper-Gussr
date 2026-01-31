@@ -377,11 +377,15 @@ except Exception as e:
 " 2>/dev/null
 }
 
-# Download and set wallpaper with full stability
+# Download and set wallpaper with full stability and text overlay
 download_and_set_wallpaper() {
     local image_url="$1"
+    local title="${2:-Bing Wallpaper}"
+    local location="${3:-Unknown Location}"
+    local wallpaper_date="${4:-$(date +%Y-%m-%d)}"
     local filename="bing_wallpaper_$(date +%Y-%m-%d).jpg"
     local wallpaper_file="$WALLPAPER_DIR/$filename"
+    local overlay_file="$WALLPAPER_DIR/overlay_$(date +%Y-%m-%d).jpg"
     
     log "Downloading wallpaper to: $wallpaper_file"
     
@@ -422,11 +426,28 @@ download_and_set_wallpaper() {
     
     log "Downloaded successfully ($(stat -f%z "$wallpaper_file" 2>/dev/null || stat -c%s "$wallpaper_file" 2>/dev/null) bytes)"
     
+    # Add text overlay using Swift tool
+    local text_overlay_tool="$(dirname "$0")/../tools/build/WallpaperTextOverlay"
+    if [ -f "$text_overlay_tool" ] && [ -x "$text_overlay_tool" ]; then
+        log "Adding text overlay: $title • $location • $wallpaper_date"
+        "$text_overlay_tool" "$wallpaper_file" "$overlay_file" "$title" "$location" "$wallpaper_date" 2>/dev/null
+        
+        if [ -f "$overlay_file" ] && [ -s "$overlay_file" ]; then
+            log "Text overlay created successfully"
+            wallpaper_file="$overlay_file"
+        else
+            log "WARNING: Text overlay failed, using original image"
+        fi
+    else
+        log "WARNING: Text overlay tool not found at $text_overlay_tool"
+    fi
+    
     # Set wallpaper using stable method
     if set_wallpaper_stable "$wallpaper_file"; then
         log "SUCCESS: Wallpaper set"
-        # Clean up old wallpapers (keep last 60 days)
-        find "$WALLPAPER_DIR" -name "bing_wallpaper_*.jpg" -mtime +60 -delete 2>/dev/null
+        # Clean up old wallpapers (keep last 7 days)
+        find "$WALLPAPER_DIR" -name "bing_wallpaper_*.jpg" -mtime +7 -delete 2>/dev/null
+        find "$WALLPAPER_DIR" -name "overlay_*.jpg" -mtime +7 -delete 2>/dev/null
         return 0
     else
         log "ERROR: Failed to set wallpaper"
@@ -492,6 +513,7 @@ main() {
     local selected_wallpaper=""
     local selected_title=""
     local selected_date=""
+    local selected_location=""
     local days_back=0
     
     while [ $days_back -lt $MAX_DAYS_BACK ]; do
@@ -517,7 +539,13 @@ main() {
                     selected_wallpaper="$url"
                     selected_title="$title"
                     selected_date="$target_date"
+                    # Extract location from title (typically after "in" or just the title itself)
+                    selected_location="$title"
+                    if [[ "$title" =~ in[[:space:]](.+)$ ]]; then
+                        selected_location="${BASH_REMATCH[1]}"
+                    fi
                     log "SELECTED: $target_date"
+                    log "Location: $selected_location"
                     break
                 else
                     log "Filtered out, trying previous day..."
@@ -534,7 +562,7 @@ main() {
     if [ -n "$selected_wallpaper" ]; then
         log "Setting: $selected_title ($selected_date)"
         
-        if download_and_set_wallpaper "$selected_wallpaper"; then
+        if download_and_set_wallpaper "$selected_wallpaper" "$selected_title" "$selected_location" "$selected_date"; then
             log "=== SUCCESS: $selected_title ==="
             clear_lock
             exit 0
