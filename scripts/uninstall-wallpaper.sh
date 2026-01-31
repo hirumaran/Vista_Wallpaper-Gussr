@@ -30,6 +30,7 @@ echo "🧹 Cleaning up log files..."
 rm -f "$HOME/Library/Logs/bing-wallpaper.log"
 rm -f "$HOME/Library/Logs/bing-wallpaper-launchd.log"
 rm -f "$HOME/Library/Logs/bing-wallpaper-launchd-error.log"
+rm -f "$HOME/.bing-wallpaper-state"
 echo "✅ Log files removed"
 
 echo ""

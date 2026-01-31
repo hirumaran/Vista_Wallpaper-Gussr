@@ -187,6 +187,64 @@ find_default_wallpaper() {
     return 1
 }
 
+# Get display resolution for optimal scaling
+get_display_resolution() {
+    local resolution
+    
+    # Try multiple methods to get resolution
+    # Method 1: system_profiler (most reliable)
+    resolution=$(system_profiler SPDisplaysDataType 2>/dev/null | grep -A 3 "Resolution" | grep -oE "[0-9]+\s*x\s*[0-9]+" | head -1 | tr -d ' ')
+    
+    # Method 2: Try AppleScript if method 1 fails
+    if [ -z "$resolution" ]; then
+        resolution=$(osascript -e '
+        try
+            tell application "Finder"
+                set disp to bounds of window of desktop
+                set w to item 3 of disp
+                set h to item 4 of disp
+                return (w as string) & "x" & (h as string)
+            end tell
+        on error
+            return ""
+        end try' 2>/dev/null)
+    fi
+    
+    # Method 3: Try sw_vers and known resolutions for MacBook models (last resort)
+    if [ -z "$resolution" ]; then
+        local model
+        model=$(sysctl -n hw.model 2>/dev/null)
+        if [[ "$model" =~ Mac.*Pro|MacBookPro|MacBookAir ]]; then
+            # Common resolutions for Mac laptops/pros
+            resolution="3024x1964"  # Modern MacBook Pro 14"
+        fi
+    fi
+    
+    echo "$resolution"
+}
+
+# Clear macOS wallpaper caches to prevent blurry lock screen
+clear_wallpaper_caches() {
+    log "Clearing macOS wallpaper caches..."
+    
+    # Clear Dock database cache
+    local db_path="$HOME/Library/Application Support/Dock/desktoppicture.db"
+    if [ -f "$db_path" ]; then
+        sqlite3 "$db_path" "DELETE FROM pictures;" 2>/dev/null || true
+        sqlite3 "$db_path" "DELETE FROM data;" 2>/dev/null || true
+    fi
+    
+    # Clear lock screen wallpaper cache
+    rm -rf "$HOME/Library/Caches/com.apple.desktop.admin" 2>/dev/null || true
+    rm -rf "$HOME/Library/Caches/com.apple.desktop.lockscreen" 2>/dev/null || true
+    rm -rf "$HOME/Library/Caches/com.apple.desktop.screensaver" 2>/dev/null || true
+    
+    # Clear other wallpaper-related caches
+    rm -rf "$HOME/Library/Caches/Desktop" 2>/dev/null || true
+    
+    log "Wallpaper caches cleared"
+}
+
 # BULLETPROOF wallpaper setter - updates ALL displays nicely
 set_wallpaper_stable() {
     local image_path="$1"
@@ -199,24 +257,73 @@ set_wallpaper_stable() {
         return 1
     fi
     
-    # 1. Update BOTH reliable keys
-    # To ensure Clamshell (which reads DB) and Active (which needs refresh) stay in sync:
-    # We update persistence/Main to ALWAYS have the new image.
-    # We update refresh/Alt to ALWAYS have the new image.
+    # Get display resolution for optimal pre-scaling
+    local display_res
+    display_res=$(get_display_resolution)
+    log "Display resolution: ${display_res:-"unknown"}"
     
-    # QUALITY FIX: Convert to PNG
-    # macOS lock screen often handles PNGs with better quality/less compression than JPGs.
-    local png_path="${image_path%.*}.png"
-    log "Converting to PNG for maximum lockscreen quality: $png_path"
-    sips -s format png "$image_path" --out "$png_path" >/dev/null 2>&1
+    # ULTRA-HIGH-QUALITY FIX: Convert to HEIC (native macOS format) with proper scaling
+    # macOS native wallpapers use HEIC format which preserves quality better
+    local heic_path="${image_path%.*}_hq.heic"
+    log "Converting to HEIC for maximum lockscreen quality: $heic_path"
     
-    # Use the PNG if conversion succeeded, otherwise fallback to original
-    if [ -f "$png_path" ]; then
-        image_path="$png_path"
+    # First, get image info
+    local img_info
+    img_info=$(sips -g pixelWidth -g pixelHeight "$image_path" 2>/dev/null)
+    local img_width=$(echo "$img_info" | grep "pixelWidth" | awk '{print $2}')
+    local img_height=$(echo "$img_info" | grep "pixelHeight" | awk '{print $2}')
+    
+    log "Original image size: ${img_width}x${img_height}"
+    
+    # Convert to HEIC with high quality settings
+    # Using sips with best quality and preserving color profile
+    if [ -n "$display_res" ]; then
+        # Pre-scale to exact display resolution to prevent macOS scaling artifacts
+        log "Pre-scaling to display resolution for sharp lock screen..."
+        sips -s format heic \
+             -s formatOptions best \
+             --resampleHeightWidthMax $(echo "$display_res" | cut -d'x' -f2) \
+             "$image_path" \
+             --out "$heic_path" >/dev/null 2>&1
+    else
+        # Keep original size if we can't detect display
+        sips -s format heic \
+             -s formatOptions best \
+             "$image_path" \
+             --out "$heic_path" >/dev/null 2>&1
     fi
     
-    local main_file="current_wallpaper.png"
-    local alt_file="current_wallpaper_refresh.png"
+    # If HEIC conversion fails, fallback to high-quality PNG
+    if [ ! -f "$heic_path" ]; then
+        log "HEIC conversion failed, trying high-quality PNG..."
+        local png_path="${image_path%.*}_hq.png"
+        
+        if [ -n "$display_res" ]; then
+            sips -s format png \
+                 --resampleHeightWidthMax $(echo "$display_res" | cut -d'x' -f2) \
+                 "$image_path" \
+                 --out "$png_path" >/dev/null 2>&1
+        else
+            sips -s format png "$image_path" --out "$png_path" >/dev/null 2>&1
+        fi
+        
+        if [ -f "$png_path" ]; then
+            image_path="$png_path"
+            log "Using high-quality PNG"
+        fi
+    else
+        image_path="$heic_path"
+        log "Using high-quality HEIC (native macOS format)"
+    fi
+    
+    # Clear caches before setting new wallpaper to prevent blurry lock screen
+    clear_wallpaper_caches
+    
+    # Get the file extension from the processed image
+    local file_ext="${image_path##*.}"
+    
+    local main_file="current_wallpaper.${file_ext}"
+    local alt_file="current_wallpaper_refresh.${file_ext}"
     
     local main_path="$STABLE_WALLPAPER_DIR/$main_file"
     local alt_path="$STABLE_WALLPAPER_DIR/$alt_file"
@@ -645,6 +752,9 @@ cleanup() {
     clear_lock
     rm -f "$JSON_CACHE_FILE"
     rm -f "$WALLPAPER_DIR/bing_wallpaper_temp.jpg"
+    # Clean up temporary high-quality conversion files
+    rm -f "$WALLPAPER_DIR"/*_hq.heic "$WALLPAPER_DIR"/*_hq.png 2>/dev/null || true
+    rm -f "$STABLE_WALLPAPER_DIR"/*_hq.heic "$STABLE_WALLPAPER_DIR"/*_hq.png 2>/dev/null || true
 }
 
 trap cleanup EXIT
