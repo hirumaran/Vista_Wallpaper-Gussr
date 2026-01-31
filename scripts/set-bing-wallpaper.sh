@@ -199,24 +199,36 @@ set_wallpaper_stable() {
         return 1
     fi
     
-    # 1. Determine target filename (A/B Toggle)
-    # We toggle between two filenames to force macOS to recognize the change.
-    # If we just overwrite the same file, macOS caching often ignores the update.
+    # 1. Update BOTH reliable keys
+    # To ensure Clamshell (which reads DB) and Active (which needs refresh) stay in sync:
+    # We update persistence/Main to ALWAYS have the new image.
+    # We update refresh/Alt to ALWAYS have the new image.
+    
+    local main_file="current_wallpaper.jpg"
+    local alt_file="current_wallpaper_refresh.jpg"
+    
+    local main_path="$STABLE_WALLPAPER_DIR/$main_file"
+    local alt_path="$STABLE_WALLPAPER_DIR/$alt_file"
+    
+    # Update both files with new image bits
+    cp -f "$image_path" "$main_path"
+    cp -f "$image_path" "$alt_path"
+    chmod 644 "$main_path" "$alt_path"
+    sync
+    
+    # 2. Determine which one to used for *Active* refresh (Toggle)
     local current_wp
     current_wp=$(get_current_wallpaper)
+    local target_path="$main_path"
     
-    local stable_filename="current_wallpaper.jpg"
-    if [[ "$current_wp" == *"/current_wallpaper.jpg" ]]; then
-        stable_filename="current_wallpaper_alt.jpg"
+    # If currently using Main, switch to Alt to force refresh
+    if [[ "$current_wp" == *"$main_file" ]]; then
+        target_path="$alt_path"
+        log "Toggling active display to: $alt_file"
+    else
+        target_path="$main_path"
+        log "Toggling active display to: $main_file"
     fi
-    
-    local stable_path="$STABLE_WALLPAPER_DIR/$stable_filename"
-    log "Toggling to stable file: $stable_filename"
-    
-    # Use cp to overwrite
-    cp -f "$image_path" "$stable_path"
-    chmod 644 "$stable_path"
-    sync
     
     # 2. Smoothly apply to all desktops using System Events
     # This handles the currently active displays immediately.
@@ -228,7 +240,7 @@ set_wallpaper_stable() {
             set desktopCount to count of desktops
             repeat with i from 1 to desktopCount
                 try
-                    set picture of desktop i to POSIX file "'"$stable_path"'"
+                    set picture of desktop i to POSIX file "'"$target_path"'"
                 end try
             end repeat
         end tell
@@ -237,23 +249,20 @@ set_wallpaper_stable() {
     end try' 2>/dev/null
     
     # 3. Persistent Fix for Clamshell/Spaces (The "Hidden" Update)
-    # macOS treats "Clamshell Mode" (Lid Closed) as a separate display arrangement.
-    # The AppleScript above only sees *currently* active desktops.
-    # To fix the "revert" issue when you close the lid, we update the internal database.
-    # We DO NOT kill the Dock (which causes the "tweaking"), we just seed the DB
-    # so the next time macOS looks for the wallpaper (i.e. layout change), it finds ours.
+    # We ALWAYS update the DB to point to the MAIN file.
+    # Since we updated the bits of MAIN above, Clamshell mode will find the new image there.
     
     local db_path="$HOME/Library/Application Support/Dock/desktoppicture.db"
     if [ -f "$db_path" ]; then
         log "Seeding wallpaper database for future layouts (Clamshell fix)..."
-        # Update ALL entries in the data table to point to our wallpaper
-        sqlite3 "$db_path" "UPDATE data SET value = '$stable_path';" 2>/dev/null
+        # Update ALL entries in the data table to point to our MAIN wallpaper
+        sqlite3 "$db_path" "UPDATE data SET value = '$main_path';" 2>/dev/null
     fi
     
-    # Verify
+    # Verify using target_path
     local current_wp
     current_wp=$(get_current_wallpaper)
-    if [ "$current_wp" = "$stable_path" ]; then
+    if [ "$current_wp" = "$target_path" ]; then
         log "SUCCESS: Wallpaper set successfully"
         return 0
     else
@@ -588,18 +597,18 @@ main() {
         local num_candidates=${#candidates_indices[@]}
         
         if [ $num_candidates -gt 0 ]; then
-            # Pick random index
-            local rand=$(( $RANDOM % $num_candidates ))
+            # Improved Randomness using date + RANDOM
+            local seed
+            seed=$(date +%s%N)
+            local rand=$(( (seed + RANDOM) % num_candidates ))
             selected_idx=${candidates_indices[$rand]}
             log "Cycling to new wallpaper (excluding $current_date)"
         else
-            # Only one option exists (or current is unknown), just use the first/best one
             selected_idx=0
             log "Cannot cycle (only 1 valid option), reusing best match"
         fi
     else
         log "Mode: DAILY UPDATE (Prioritizing newest)"
-        # Just pick the first one (newest)
         selected_idx=0
     fi
     
