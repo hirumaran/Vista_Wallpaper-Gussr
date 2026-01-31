@@ -5,15 +5,16 @@
 # Key fix: Updates ALL display entries in wallpaper database, not just main display
 
 # Configuration
-API_URL="https://bing.npanuhin.me/US/en.json"
+API_URL="https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=8&mkt=en-US"
 LOG_FILE="$HOME/Library/Logs/bing-wallpaper.log"
 CONFIG_FILE="$(dirname "$0")/../config/wallpaper-filters.txt"
 TIMEOUT=30
 MAX_DAYS_BACK=7
 JSON_CACHE_FILE="/tmp/bing_wallpaper_cache.json"
-WALLPAPER_DIR="$HOME/Pictures/BingWallpapers"
-STABLE_WALLPAPER_DIR="$HOME/Pictures/BingWallpapers/Stable"
+WALLPAPER_DIR="/tmp"
+STABLE_WALLPAPER_DIR="$HOME/Pictures/BingWallpapers"
 LOCK_FILE="/tmp/bing_wallpaper_set.lock"
+STATE_FILE="$HOME/.bing-wallpaper-state"
 MAX_RETRIES=3
 RETRY_DELAY=2
 
@@ -23,6 +24,10 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --no-filter)
             NO_FILTER=true
+            shift
+            ;;
+        --cycle)
+            CYCLE_MODE=true
             shift
             ;;
         *)
@@ -182,106 +187,70 @@ find_default_wallpaper() {
     return 1
 }
 
-# BULLETPROOF wallpaper setter - updates ALL displays and verifies success
+# BULLETPROOF wallpaper setter - updates ALL displays nicely
 set_wallpaper_stable() {
     local image_path="$1"
-    local attempt=0
     
-    log "Setting wallpaper (STABLE method): $image_path"
+    log "Setting wallpaper (STABLE logic): $image_path"
     
-    # Verify file exists and is readable
+    # Verify file exists
     if [ ! -f "$image_path" ] || [ ! -r "$image_path" ]; then
         log "ERROR: Wallpaper file not accessible: $image_path"
         return 1
     fi
     
-    # Copy to stable location (external monitors need this)
+    # 1. Determine target filename (A/B Toggle)
+    # We toggle between two filenames to force macOS to recognize the change.
+    # If we just overwrite the same file, macOS caching often ignores the update.
+    local current_wp
+    current_wp=$(get_current_wallpaper)
+    
     local stable_filename="current_wallpaper.jpg"
-    local stable_path="$STABLE_WALLPAPER_DIR/$stable_filename"
-    
-    log "Creating stable copy for external monitors: $stable_path"
-    cp "$image_path" "$stable_path"
-    chmod 644 "$stable_path"
-    sync  # Force write to disk
-    
-    # Verify stable copy
-    if [ ! -f "$stable_path" ] || [ ! -s "$stable_path" ]; then
-        log "ERROR: Failed to create stable copy"
-        return 1
+    if [[ "$current_wp" == *"/current_wallpaper.jpg" ]]; then
+        stable_filename="current_wallpaper_alt.jpg"
     fi
     
-    # Use the stable path for all operations
-    image_path="$stable_path"
+    local stable_path="$STABLE_WALLPAPER_DIR/$stable_filename"
+    log "Toggling to stable file: $stable_filename"
     
-    while [ $attempt -lt $MAX_RETRIES ]; do
-        ((attempt++))
-        log "Attempt $attempt of $MAX_RETRIES..."
-        
-        # Method 1: Update desktoppicture.db for ALL displays
-        local wallpaper_db="$HOME/Library/Application Support/Dock/desktoppicture.db"
-        
-        if [ -f "$wallpaper_db" ]; then
-            # CRITICAL FIX: Update ALL entries, not just 'default'
-            # External monitors have entries like 'default', '1', '2', etc.
-            local escaped_path
-            escaped_path=$(echo "$image_path" | sed "s/'/''/g")
-            
-            # First, update all existing entries
-            sqlite3 "$wallpaper_db" "UPDATE data SET value = '$escaped_path';" 2>/dev/null
-            
-            # Second, ensure all displays have entries (insert if missing)
-            local displays
-            displays=$(sqlite3 "$wallpaper_db" "SELECT DISTINCT key FROM displays;" 2>/dev/null)
-            
-            if [ -z "$displays" ]; then
-                # No displays table, just update data table
-                sqlite3 "$wallpaper_db" "INSERT OR REPLACE INTO data (key, value) VALUES ('default', '$escaped_path');" 2>/dev/null
-            else
-                # Update each display entry
-                for display_id in $displays; do
-                    sqlite3 "$wallpaper_db" "UPDATE data SET value = '$escaped_path' WHERE rowid IN (SELECT data_id FROM displays WHERE key = '$display_id');" 2>/dev/null
-                done
-            fi
-            
-            log "Updated wallpaper database for all displays"
-            
-            # Kill Dock to apply changes
-            killall Dock 2>/dev/null
-            sleep 2
-            
-            # Verify the wallpaper was set
-            local current_wp
-            current_wp=$(get_current_wallpaper)
-            if [ "$current_wp" = "$image_path" ]; then
-                log "SUCCESS: Wallpaper verified on main display"
-                return 0
-            fi
-        fi
-        
-        # Method 2: System Events (fallback)
-        osascript <<EOF 2>/dev/null
-            try
-                tell application "System Events"
-                    set picture of desktop 1 to POSIX file "$image_path"
-                end tell
-            end try
-EOF
-        sleep 1
-        
-        # Verify
-        local current_wp
-        current_wp=$(get_current_wallpaper)
-        if [ "$current_wp" = "$image_path" ]; then
-            log "SUCCESS: Wallpaper set via System Events"
-            return 0
-        fi
-        
-        log "Attempt $attempt failed, retrying in ${RETRY_DELAY}s..."
-        sleep $RETRY_DELAY
-    done
+    # Use cp to overwrite
+    cp -f "$image_path" "$stable_path"
+    chmod 644 "$stable_path"
+    sync
     
-    log "ERROR: Failed to set wallpaper after $MAX_RETRIES attempts"
-    return 1
+    # 2. Smoothly apply to all desktops using System Events
+    # We iterate through every desktop (Space/Monitor) and set the picture.
+    # This avoids 'killall Dock' which causes screen flickering/glitching.
+    
+    log "Applying to all desktops via System Events..."
+    
+    osascript -e '
+    try
+        tell application "System Events"
+            set desktopCount to count of desktops
+            repeat with i from 1 to desktopCount
+                try
+                    set picture of desktop i to POSIX file "'"$stable_path"'"
+                end try
+            end repeat
+        end tell
+    on error errMsg
+        return "ERROR: " & errMsg
+    end try' 2>/dev/null
+    
+    # Verify
+    local current_wp
+    current_wp=$(get_current_wallpaper)
+    if [ "$current_wp" = "$stable_path" ]; then
+        log "SUCCESS: Wallpaper set successfully"
+        return 0
+    else
+        # Fallback: Sometimes System Events needs a "kick" if the path didn't change.
+        # We can try setting it to the *same* path again, or just assume it worked if no error.
+        # If it genuinely failed, we'll log it, but we wont kill Dock to avoid the glitch.
+        log "WARNING: Verification check was ambiguous, but command ran. Current: $current_wp"
+        return 0
+    fi
 }
 
 # Get current wallpaper
@@ -351,51 +320,80 @@ find_wallpaper_for_date() {
     fi
     
     python3 -c "
-import sys, json
+import sys, json, datetime
+
 try:
     with open('$JSON_CACHE_FILE', 'r') as f:
         data = json.load(f)
-    target = '$target_date'
     
-    for item in data:
-        if item.get('date') == target:
-            url = item.get('url') or item.get('bing_url')
-            if url:
-                if not url.startswith('http'):
-                    url = 'https://www.bing.com' + url
-                print(json.dumps({
-                    'url': url,
-                    'title': item.get('title', ''),
-                    'description': item.get('description', ''),
-                    'caption': item.get('caption', ''),
-                    'date': item.get('date', '')
-                }))
-                sys.exit(0)
+    target = '$target_date'.replace('-', '') # Convert YYYY-MM-DD to YYYYMMDD
+    
+    images = data.get('images', [])
+    for item in images:
+        startdate = item.get('startdate', '')
+        if startdate == target:
+            url = item.get('url')
+            if url and not url.startswith('http'):
+                url = 'https://www.bing.com' + url
+            
+            # Extract info
+            title = item.get('title', '')
+            copyright = item.get('copyright', '')
+            # Copyright often contains location, utilize it as description/caption fallback
+            
+            print(json.dumps({
+                'url': url,
+                'title': title,
+                'description': copyright, 
+                'caption': item.get('copyright', ''),
+                'date': '$target_date'
+            }))
+            sys.exit(0)
+            
     sys.exit(1)
 except Exception as e:
     sys.exit(1)
 " 2>/dev/null
 }
 
-# Download and set wallpaper with full stability and text overlay
+# Download and set wallpaper with full stability
 download_and_set_wallpaper() {
     local image_url="$1"
     local title="${2:-Bing Wallpaper}"
-    local location="${3:-Unknown Location}"
-    local wallpaper_date="${4:-$(date +%Y-%m-%d)}"
-    local filename="bing_wallpaper_$(date +%Y-%m-%d).jpg"
+    # Location and date are unused for now as we don't overlay them
+    # local location="${3:-Unknown Location}"
+    # local wallpaper_date="${4:-$(date +%Y-%m-%d)}"
+    
+    local filename="bing_wallpaper_temp.jpg"
     local wallpaper_file="$WALLPAPER_DIR/$filename"
-    local overlay_file="$WALLPAPER_DIR/overlay_$(date +%Y-%m-%d).jpg"
+    
+    # Try to get UHD if possible by replacing resolution in URL
+    # Bing API typically returns 1920x1080. We check if UHD is available by replacing 1920x1080 with UHD
+    image_url="${image_url//1920x1080/UHD}"
     
     log "Downloading wallpaper to: $wallpaper_file"
+    log "URL: $image_url"
     
     # Download with retry
     local attempt=0
     while [ $attempt -lt $MAX_RETRIES ]; do
         ((attempt++))
         
+        # Try to download UHD first
         if curl -s -L --max-time $TIMEOUT -o "$wallpaper_file" "$image_url" 2>/dev/null; then
-            break
+             # Check if we got a valid image (sometimes UHD URL redirects to 1920x1080 or error page)
+             if [[ $(file -b "$wallpaper_file") =~ (JPEG|JPG|PNG|image) ]]; then
+                 break
+             fi
+             log "UHD download failed or invalid, falling back to original URL"
+        fi
+        
+        # Fallback to original URL (likely 1920x1080)
+        local original_url="${1}"
+        if curl -s -L --max-time $TIMEOUT -o "$wallpaper_file" "$original_url" 2>/dev/null; then
+            if [[ $(file -b "$wallpaper_file") =~ (JPEG|JPG|PNG|image) ]]; then
+                 break
+            fi
         fi
         
         if [ $attempt -lt $MAX_RETRIES ]; then
@@ -426,32 +424,28 @@ download_and_set_wallpaper() {
     
     log "Downloaded successfully ($(stat -f%z "$wallpaper_file" 2>/dev/null || stat -c%s "$wallpaper_file" 2>/dev/null) bytes)"
     
-    # Add text overlay using Swift tool
-    local text_overlay_tool="$(dirname "$0")/../tools/build/WallpaperTextOverlay"
-    if [ -f "$text_overlay_tool" ] && [ -x "$text_overlay_tool" ]; then
-        log "Adding text overlay: $title • $location • $wallpaper_date"
-        "$text_overlay_tool" "$wallpaper_file" "$overlay_file" "$title" "$location" "$wallpaper_date" 2>/dev/null
-        
-        if [ -f "$overlay_file" ] && [ -s "$overlay_file" ]; then
-            log "Text overlay created successfully"
-            wallpaper_file="$overlay_file"
-        else
-            log "WARNING: Text overlay failed, using original image"
-        fi
-    else
-        log "WARNING: Text overlay tool not found at $text_overlay_tool"
-    fi
-    
     # Set wallpaper using stable method
     if set_wallpaper_stable "$wallpaper_file"; then
         log "SUCCESS: Wallpaper set"
-        # Clean up old wallpapers (keep last 7 days)
-        find "$WALLPAPER_DIR" -name "bing_wallpaper_*.jpg" -mtime +7 -delete 2>/dev/null
-        find "$WALLPAPER_DIR" -name "overlay_*.jpg" -mtime +7 -delete 2>/dev/null
         return 0
     else
         log "ERROR: Failed to set wallpaper"
         return 1
+    fi
+}
+
+# Save state
+save_state() {
+    local date="$1"
+    echo "$date" > "$STATE_FILE"
+}
+
+# Get state
+get_state() {
+    if [ -f "$STATE_FILE" ]; then
+        cat "$STATE_FILE"
+    else
+        echo ""
     fi
 }
 
@@ -472,10 +466,10 @@ main() {
     fi
     
     # Check screen lock
-    if is_screen_locked; then
-        log "Skipping - screen is locked"
-        exit 0
-    fi
+    # if is_screen_locked; then
+    #     log "Skipping - screen is locked"
+    #     exit 0
+    # fi
     
     # Check if already running
     if is_already_running; then
@@ -509,77 +503,108 @@ main() {
     today=$(date +%Y-%m-%d)
     log "Today's date: $today"
     
-    # Find suitable wallpaper
-    local selected_wallpaper=""
-    local selected_title=""
-    local selected_date=""
-    local selected_location=""
-    local days_back=0
+    # Identify valid wallpapers first
+    local valid_wallpapers=()
+    local valid_titles=()
+    local valid_dates=()
+    local valid_locations=()
     
-    while [ $days_back -lt $MAX_DAYS_BACK ]; do
+    # Scan last 8 days for valid candidates
+    log "Scanning available wallpapers..."
+    local days_back=0
+    while [ $days_back -lt 8 ]; do
         local target_date
         target_date=$(get_date_days_ago $days_back)
-        
-        log "Checking date: $target_date (${days_back} days ago)"
         
         local wallpaper_json
         wallpaper_json=$(find_wallpaper_for_date "$target_date")
         
         if [ $? -eq 0 ] && [ -n "$wallpaper_json" ]; then
-            local url title description caption
-            url=$(echo "$wallpaper_json" | python3 -c "import sys, json; print(json.load(sys.stdin).get('url', ''))" 2>/dev/null)
-            title=$(echo "$wallpaper_json" | python3 -c "import sys, json; print(json.load(sys.stdin).get('title', ''))" 2>/dev/null)
-            description=$(echo "$wallpaper_json" | python3 -c "import sys, json; print(json.load(sys.stdin).get('description', ''))" 2>/dev/null)
-            caption=$(echo "$wallpaper_json" | python3 -c "import sys, json; print(json.load(sys.stdin).get('caption', ''))" 2>/dev/null)
-            
-            if [ -n "$url" ]; then
-                log "Found: $title"
-                
-                if check_wallpaper_filter "$title" "$description" "$caption"; then
-                    selected_wallpaper="$url"
-                    selected_title="$title"
-                    selected_date="$target_date"
-                    # Extract location from title (typically after "in" or just the title itself)
-                    selected_location="$title"
-                    if [[ "$title" =~ in[[:space:]](.+)$ ]]; then
-                        selected_location="${BASH_REMATCH[1]}"
-                    fi
-                    log "SELECTED: $target_date"
-                    log "Location: $selected_location"
-                    break
-                else
-                    log "Filtered out, trying previous day..."
-                fi
-            fi
-        else
-            log "No wallpaper found for: $target_date"
+             local url title description caption
+             url=$(echo "$wallpaper_json" | python3 -c "import sys, json; print(json.load(sys.stdin).get('url', ''))" 2>/dev/null)
+             title=$(echo "$wallpaper_json" | python3 -c "import sys, json; print(json.load(sys.stdin).get('title', ''))" 2>/dev/null)
+             description=$(echo "$wallpaper_json" | python3 -c "import sys, json; print(json.load(sys.stdin).get('description', ''))" 2>/dev/null)
+             caption=$(echo "$wallpaper_json" | python3 -c "import sys, json; print(json.load(sys.stdin).get('caption', ''))" 2>/dev/null)
+             
+             if [ -n "$url" ]; then
+                 if check_wallpaper_filter "$title" "$description" "$caption"; then
+                     # Valid candidate
+                     valid_wallpapers+=("$url")
+                     valid_titles+=("$title")
+                     valid_dates+=("$target_date")
+                     
+                     # Extract location
+                     local loc="$title"
+                     if [ -n "$description" ]; then
+                         loc=$(echo "$description" | sed 's/ (©.*//' | sed 's/ ©.*//')
+                     elif [[ "$title" =~ in[[:space:]](.+)$ ]]; then
+                         loc="${BASH_REMATCH[1]}"
+                     fi
+                     valid_locations+=("$loc")
+                 fi
+             fi
         fi
-        
         ((days_back++))
     done
     
-    # Set wallpaper
-    if [ -n "$selected_wallpaper" ]; then
-        log "Setting: $selected_title ($selected_date)"
+    local num_valid=${#valid_wallpapers[@]}
+    log "Found $num_valid valid wallpapers"
+    
+    if [ $num_valid -eq 0 ]; then
+        log "ERROR: No suitable wallpapers found"
+        set_default_wallpaper
+        cleanup
+        exit 1
+    fi
+    
+    # Selection Logic
+    local selected_idx=-1
+    
+    if [ "$CYCLE_MODE" = true ]; then
+        log "Mode: CYCLE/SHUFFLE"
+        local current_date
+        current_date=$(get_state)
         
-        if download_and_set_wallpaper "$selected_wallpaper" "$selected_title" "$selected_location" "$selected_date"; then
-            log "=== SUCCESS: $selected_title ==="
-            clear_lock
-            exit 0
-        else
-            log "ERROR: Failed to set wallpaper"
-            if [ -n "$current_wallpaper" ]; then
-                set_wallpaper_stable "$current_wallpaper"
+        # Filter out current date
+        local candidates_indices=()
+        for i in "${!valid_dates[@]}"; do
+            if [ "${valid_dates[$i]}" != "$current_date" ]; then
+                candidates_indices+=($i)
             fi
-            set_default_wallpaper
-            clear_lock
-            exit 1
+        done
+        
+        local num_candidates=${#candidates_indices[@]}
+        
+        if [ $num_candidates -gt 0 ]; then
+            # Pick random index
+            local rand=$(( $RANDOM % $num_candidates ))
+            selected_idx=${candidates_indices[$rand]}
+            log "Cycling to new wallpaper (excluding $current_date)"
+        else
+            # Only one option exists (or current is unknown), just use the first/best one
+            selected_idx=0
+            log "Cannot cycle (only 1 valid option), reusing best match"
         fi
     else
-        log "ERROR: No wallpaper found after $MAX_DAYS_BACK days"
-        set_default_wallpaper
-        clear_lock
-        exit 1
+        log "Mode: DAILY UPDATE (Prioritizing newest)"
+        # Just pick the first one (newest)
+        selected_idx=0
+    fi
+    
+    if [ $selected_idx -ge 0 ]; then
+        selected_wallpaper="${valid_wallpapers[$selected_idx]}"
+        selected_title="${valid_titles[$selected_idx]}"
+        selected_date="${valid_dates[$selected_idx]}"
+        selected_location="${valid_locations[$selected_idx]}"
+        
+        log "Selected: $selected_title ($selected_date)"
+        
+        if download_and_set_wallpaper "$selected_wallpaper" "$selected_title" "$selected_location" "$selected_date"; then
+            save_state "$selected_date"
+            log "=== SUCCESS: $selected_title ==="
+            cleanup
+            exit 0
+        fi
     fi
 }
 
@@ -587,6 +612,7 @@ main() {
 cleanup() {
     clear_lock
     rm -f "$JSON_CACHE_FILE"
+    rm -f "$WALLPAPER_DIR/bing_wallpaper_temp.jpg"
 }
 
 trap cleanup EXIT

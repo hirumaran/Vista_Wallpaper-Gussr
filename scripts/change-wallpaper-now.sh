@@ -20,8 +20,8 @@ echo ""
 echo "📡 Fetching today's wallpaper from Bing..."
 echo ""
 
-# Call the main wallpaper script with any passed arguments
-"$SCRIPT_DIR/set-bing-wallpaper.sh" "$@"
+# Call the main wallpaper script to cycle/shuffle wallpaper
+"$SCRIPT_DIR/set-bing-wallpaper.sh" --cycle "$@"
 
 # Check the exit status
 if [ $? -eq 0 ]; then
